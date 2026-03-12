@@ -2,4 +2,6 @@ Flask==2.3.3
 python-chess==1.999
 numpy>=1.21.0
 gunicorn==20.1.0
+torch
+
 
