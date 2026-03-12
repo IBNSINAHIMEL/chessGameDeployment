@@ -7,6 +7,7 @@ Trained on 16.5M positions with PyTorch (4.9M parameters)
 - Evaluation statistics tracking
 - Robust error handling
 - LRU caching for repeated positions
+- Graceful fallback when PyTorch not available
 """
 
 import chess
@@ -15,9 +16,10 @@ import os
 import sys
 import numpy as np
 from functools import lru_cache
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union, Any
 import json
 
+# Make PyTorch optional with graceful fallback
 try:
     import torch
     import torch.nn as nn
@@ -25,12 +27,16 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
-    print("⚠️  PyTorch not installed – ML model will not work.")
-    # Dummy classes to allow module loading
-    class nn:
-        class Module:
-            pass
     torch = None
+    nn = None
+    F = None
+    print("⚠️  PyTorch not installed – ML model will run in fallback mode (returns 0.0).")
+
+# Define a placeholder for Tensor type when torch is not available
+if TORCH_AVAILABLE:
+    TensorType = torch.Tensor
+else:
+    TensorType = Any
 
 # ------------------------------------------------------------
 # Device detection with CUDA fallback
@@ -38,7 +44,7 @@ except ImportError:
 def get_optimal_device():
     """Returns the best available device with CUDA if available."""
     if not TORCH_AVAILABLE:
-        return torch.device('cpu')
+        return None
     if torch.cuda.is_available():
         device = torch.device('cuda')
         # Optimize CUDA performance
@@ -54,70 +60,80 @@ def get_optimal_device():
 # ------------------------------------------------------------
 # Exact definition of the ChessNN class used during training
 # ------------------------------------------------------------
-class ChessNN(nn.Module):
-    """CNN for chess position evaluation (same as in training script)."""
-    
-    def __init__(self):
-        super().__init__()
+if TORCH_AVAILABLE:
+    class ChessNN(nn.Module):
+        """CNN for chess position evaluation (same as in training script)."""
         
-        # Initial convolution
-        self.conv1 = nn.Conv2d(20, 128, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(128)
+        def __init__(self):
+            super().__init__()
+            
+            # Initial convolution
+            self.conv1 = nn.Conv2d(20, 128, kernel_size=3, padding=1)
+            self.bn1 = nn.BatchNorm2d(128)
+            
+            # Residual blocks
+            self.res_block1 = self._make_res_block(128, 128)
+            self.res_block2 = self._make_res_block(128, 256, stride=2)
+            self.res_block3 = self._make_res_block(256, 512, stride=2)
+            
+            # Global pooling
+            self.global_pool = nn.AdaptiveAvgPool2d(1)
+            
+            # Value head
+            self.value_head = nn.Sequential(
+                nn.Linear(512, 256),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(256, 128),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(128, 1),
+                nn.Tanh()
+            )
+            
+            self._init_weights()
         
-        # Residual blocks
-        self.res_block1 = self._make_res_block(128, 128)
-        self.res_block2 = self._make_res_block(128, 256, stride=2)
-        self.res_block3 = self._make_res_block(256, 512, stride=2)
+        def _make_res_block(self, in_channels, out_channels, stride=1):
+            return nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(),
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_channels)
+            )
         
-        # Global pooling
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        def _init_weights(self):
+            for m in self.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                elif isinstance(m, nn.BatchNorm2d):
+                    nn.init.constant_(m.weight, 1)
+                    nn.init.constant_(m.bias, 0)
+                elif isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, 0, 0.01)
+                    nn.init.constant_(m.bias, 0)
         
-        # Value head
-        self.value_head = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 1),
-            nn.Tanh()
-        )
-        
-        self._init_weights()
-    
-    def _make_res_block(self, in_channels, out_channels, stride=1):
-        return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels)
-        )
-    
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.constant_(m.bias, 0)
-    
-    def forward(self, x):
-        # Initial conv
-        x = torch.relu(self.bn1(self.conv1(x)))
-        identity = x
-        x = self.res_block1(x)
-        x = torch.relu(x + identity)
-        x = self.res_block2(x)
-        x = self.res_block3(x)
-        x = self.global_pool(x)
-        x = x.view(x.size(0), -1)
-        value = self.value_head(x)
-        return value
+        def forward(self, x):
+            # Initial conv
+            x = torch.relu(self.bn1(self.conv1(x)))
+            identity = x
+            x = self.res_block1(x)
+            x = torch.relu(x + identity)
+            x = self.res_block2(x)
+            x = self.res_block3(x)
+            x = self.global_pool(x)
+            x = x.view(x.size(0), -1)
+            value = self.value_head(x)
+            return value
+else:
+    # Dummy class when PyTorch not available
+    class ChessNN:
+        def __init__(self):
+            pass
+        def eval(self):
+            return self
+        def to(self, device):
+            return self
 
 
 # ------------------------------------------------------------
@@ -129,11 +145,15 @@ _PIECE_MAP = {
 }
 
 @lru_cache(maxsize=1024)
-def fen_to_tensor_helper(fen: str) -> torch.Tensor:
+def fen_to_tensor_helper(fen: str) -> Optional[Any]:
     """
     Convert FEN to 20x8x8 tensor for evaluation.
+    Returns None if PyTorch not available.
     Cached for repeated positions to avoid recomputation.
     """
+    if not TORCH_AVAILABLE:
+        return None
+        
     try:
         board = chess.Board(fen)
         tensor = np.zeros((20, 8, 8), dtype=np.float32)
@@ -167,151 +187,162 @@ def fen_to_tensor_helper(fen: str) -> torch.Tensor:
         return torch.from_numpy(tensor)
     except Exception as e:
         print(f"Error converting FEN: {e}")
-        return torch.zeros(20, 8, 8)
+        return torch.zeros(20, 8, 8) if TORCH_AVAILABLE else None
 
 
 # ------------------------------------------------------------
 # WrappedModel class – optimized evaluate() with consistent scaling
 # ------------------------------------------------------------
-class WrappedModel:
-    """Wrapper that provides fast, consistent evaluation."""
-    
-    # Evaluation constants for consistent scaling
-    CENTIPAWN_SCALE = 300.0
-    MATE_SCORE = 100000
-    MAX_CENTIPAWN = 10000
-    
-    def __init__(self, model: nn.Module, device: torch.device, use_half: bool = True):
-        self.model = model
-        self.device = device
-        self.use_half = use_half and (device.type == 'cuda')
+if TORCH_AVAILABLE:
+    class WrappedModel:
+        """Wrapper that provides fast, consistent evaluation."""
         
-        # Convert model to half if using GPU
-        if self.use_half:
-            self.model = self.model.half()
+        # Evaluation constants for consistent scaling
+        CENTIPAWN_SCALE = 300.0
+        MATE_SCORE = 100000
+        MAX_CENTIPAWN = 10000
         
-        self.model.eval()
-        
-        # Optional: compile model for faster inference (PyTorch 2.0+)
-        if hasattr(torch, 'compile') and device.type == 'cuda':
-            try:
-                self.model = torch.compile(self.model, mode='reduce-overhead')
-                print("   Model compiled with torch.compile")
-            except Exception:
-                pass
-        
-        # Evaluation statistics for normalization (optional)
-        self.eval_stats = {
-            'mean': 0.0,
-            'std': 300.0,
-            'min': -10000,
-            'max': 10000,
-            'samples': []
-        }
-        self.collect_stats = True
-        self.max_stats_samples = 1000
-        
-    def _normalize_centipawns(self, raw_value: float) -> float:
-        """
-        Convert raw network output (-1 to 1) to consistent centipawns.
-        Uses arctanh scaling with bounds to prevent extreme values.
-        """
-        # Clip to safe range for arctanh
-        clipped = max(-0.99, min(0.99, raw_value))
-        
-        # Convert to centipawns using inverse tanh
-        centipawns = self.CENTIPAWN_SCALE * np.arctanh(clipped)
-        
-        # Bound to reasonable range
-        centipawns = max(-self.MAX_CENTIPAWN, min(self.MAX_CENTIPAWN, centipawns))
-        
-        return centipawns
-    
-    @torch.no_grad()
-    def evaluate(self, fen: str) -> float:
-        """Evaluate a single position, returning centipawn score."""
-        try:
-            # Handle terminal positions quickly
-            board = chess.Board(fen)
-            if board.is_checkmate():
-                return -self.MATE_SCORE if board.turn == chess.WHITE else self.MATE_SCORE
-            if board.is_stalemate() or board.is_insufficient_material():
-                return 0.0
+        def __init__(self, model: nn.Module, device: torch.device, use_half: bool = True):
+            self.model = model
+            self.device = device
+            self.use_half = use_half and (device.type == 'cuda')
             
-            # Convert FEN to tensor
-            tensor = fen_to_tensor_helper(fen).to(self.device)
-            
-            # Add batch dimension and optionally convert to half
+            # Convert model to half if using GPU
             if self.use_half:
-                tensor = tensor.half()
-            tensor = tensor.unsqueeze(0)
+                self.model = self.model.half()
             
-            # Run inference
-            normalized = self.model(tensor).item()
+            self.model.eval()
             
-            # Convert to centipawns
-            centipawns = self._normalize_centipawns(normalized)
+            # Optional: compile model for faster inference (PyTorch 2.0+)
+            if hasattr(torch, 'compile') and device.type == 'cuda':
+                try:
+                    self.model = torch.compile(self.model, mode='reduce-overhead')
+                    print("   Model compiled with torch.compile")
+                except Exception:
+                    pass
             
-            # Collect statistics (optional)
-            if self.collect_stats and len(self.eval_stats['samples']) < self.max_stats_samples:
-                self.eval_stats['samples'].append(centipawns)
-                if len(self.eval_stats['samples']) == self.max_stats_samples:
-                    self.eval_stats['mean'] = float(np.mean(self.eval_stats['samples']))
-                    self.eval_stats['std'] = float(np.std(self.eval_stats['samples']))
-                    self.eval_stats['min'] = float(np.min(self.eval_stats['samples']))
-                    self.eval_stats['max'] = float(np.max(self.eval_stats['samples']))
-                    print(f"📊 Evaluation stats: mean={self.eval_stats['mean']:.1f}, "
-                          f"std={self.eval_stats['std']:.1f}, "
-                          f"range=[{self.eval_stats['min']:.0f}, {self.eval_stats['max']:.0f}]")
-                    self.collect_stats = False
+            # Evaluation statistics for normalization (optional)
+            self.eval_stats = {
+                'mean': 0.0,
+                'std': 300.0,
+                'min': -10000,
+                'max': 10000,
+                'samples': []
+            }
+            self.collect_stats = True
+            self.max_stats_samples = 1000
+            
+        def _normalize_centipawns(self, raw_value: float) -> float:
+            """
+            Convert raw network output (-1 to 1) to consistent centipawns.
+            Uses arctanh scaling with bounds to prevent extreme values.
+            """
+            # Clip to safe range for arctanh
+            clipped = max(-0.99, min(0.99, raw_value))
+            
+            # Convert to centipawns using inverse tanh
+            centipawns = self.CENTIPAWN_SCALE * np.arctanh(clipped)
+            
+            # Bound to reasonable range
+            centipawns = max(-self.MAX_CENTIPAWN, min(self.MAX_CENTIPAWN, centipawns))
             
             return centipawns
-            
-        except Exception as e:
-            print(f"Evaluation error: {e}")
-            return 0.0
-    
-    @torch.no_grad()
-    def evaluate_batch(self, fens: List[str]) -> List[float]:
-        """
-        Evaluate multiple positions in a batch for higher throughput.
-        Useful for move generation during search.
-        """
-        if not fens:
-            return []
         
-        try:
-            # Convert all FENs to tensors
-            tensors = []
-            for fen in fens:
-                tensors.append(fen_to_tensor_helper(fen))
+        @torch.no_grad()
+        def evaluate(self, fen: str) -> float:
+            """Evaluate a single position, returning centipawn score."""
+            try:
+                # Handle terminal positions quickly
+                board = chess.Board(fen)
+                if board.is_checkmate():
+                    return -self.MATE_SCORE if board.turn == chess.WHITE else self.MATE_SCORE
+                if board.is_stalemate() or board.is_insufficient_material():
+                    return 0.0
+                
+                # Convert FEN to tensor
+                tensor = fen_to_tensor_helper(fen).to(self.device)
+                
+                # Add batch dimension and optionally convert to half
+                if self.use_half:
+                    tensor = tensor.half()
+                tensor = tensor.unsqueeze(0)
+                
+                # Run inference
+                normalized = self.model(tensor).item()
+                
+                # Convert to centipawns
+                centipawns = self._normalize_centipawns(normalized)
+                
+                # Collect statistics (optional)
+                if self.collect_stats and len(self.eval_stats['samples']) < self.max_stats_samples:
+                    self.eval_stats['samples'].append(centipawns)
+                    if len(self.eval_stats['samples']) == self.max_stats_samples:
+                        self.eval_stats['mean'] = float(np.mean(self.eval_stats['samples']))
+                        self.eval_stats['std'] = float(np.std(self.eval_stats['samples']))
+                        self.eval_stats['min'] = float(np.min(self.eval_stats['samples']))
+                        self.eval_stats['max'] = float(np.max(self.eval_stats['samples']))
+                        print(f"📊 Evaluation stats: mean={self.eval_stats['mean']:.1f}, "
+                              f"std={self.eval_stats['std']:.1f}, "
+                              f"range=[{self.eval_stats['min']:.0f}, {self.eval_stats['max']:.0f}]")
+                        self.collect_stats = False
+                
+                return centipawns
+                
+            except Exception as e:
+                print(f"Evaluation error: {e}")
+                return 0.0
+        
+        @torch.no_grad()
+        def evaluate_batch(self, fens: List[str]) -> List[float]:
+            """
+            Evaluate multiple positions in a batch for higher throughput.
+            Useful for move generation during search.
+            """
+            if not fens:
+                return []
             
-            # Stack into batch
-            batch = torch.stack(tensors).to(self.device)
-            if self.use_half:
-                batch = batch.half()
-            
-            # Run inference
-            normalized = self.model(batch).cpu().numpy().flatten()
-            
-            # Convert each to centipawns
-            results = []
-            for val in normalized:
-                results.append(self._normalize_centipawns(float(val)))
-            
-            return results
-            
-        except Exception as e:
-            print(f"Batch evaluation error: {e}")
+            try:
+                # Convert all FENs to tensors
+                tensors = []
+                for fen in fens:
+                    tensors.append(fen_to_tensor_helper(fen))
+                
+                # Stack into batch
+                batch = torch.stack(tensors).to(self.device)
+                if self.use_half:
+                    batch = batch.half()
+                
+                # Run inference
+                normalized = self.model(batch).cpu().numpy().flatten()
+                
+                # Convert each to centipawns
+                results = []
+                for val in normalized:
+                    results.append(self._normalize_centipawns(float(val)))
+                
+                return results
+                
+            except Exception as e:
+                print(f"Batch evaluation error: {e}")
+                return [0.0] * len(fens)
+else:
+    # Dummy class when PyTorch not available
+    class WrappedModel:
+        def __init__(self, *args, **kwargs):
+            pass
+        def evaluate(self, fen):
+            return 0.0
+        def evaluate_batch(self, fens):
             return [0.0] * len(fens)
 
 
 # ------------------------------------------------------------
 # Make classes available in __main__ for pickle compatibility
 # ------------------------------------------------------------
-sys.modules['__main__'].ChessNN = ChessNN
-sys.modules['__main__'].WrappedModel = WrappedModel
-sys.modules['__main__'].fen_to_tensor_helper = fen_to_tensor_helper
+if TORCH_AVAILABLE:
+    sys.modules['__main__'].ChessNN = ChessNN
+    sys.modules['__main__'].WrappedModel = WrappedModel
+    sys.modules['__main__'].fen_to_tensor_helper = fen_to_tensor_helper
 
 
 # ------------------------------------------------------------
@@ -323,8 +354,8 @@ class ChessMLModel:
     def __init__(self, model_path: Optional[str] = None, use_half: bool = True):
         self.model = None
         self.load_time = None
-        self.device = get_optimal_device()
-        self.use_half = use_half and (self.device.type == 'cuda')
+        self.device = get_optimal_device() if TORCH_AVAILABLE else None
+        self.use_half = use_half and (self.device and self.device.type == 'cuda') if TORCH_AVAILABLE else False
         
         # Evaluation cache using LRU
         self.evaluate_position = lru_cache(maxsize=20000)(self._evaluate_position_impl)
@@ -337,7 +368,7 @@ class ChessMLModel:
         }
 
         if not TORCH_AVAILABLE:
-            print("⚠️  PyTorch not installed – cannot load ML model.")
+            print("⚠️  PyTorch not installed – ML model disabled. Using fallback evaluation (returns 0.0).")
             return
 
         try:
@@ -441,7 +472,7 @@ class ChessMLModel:
 
     def _evaluate_position_impl(self, fen: str) -> float:
         """Internal evaluation without caching (called by LRU wrapper)."""
-        if self.model is None:
+        if self.model is None or not TORCH_AVAILABLE:
             return 0.0
 
         start_time = time.time()
@@ -462,20 +493,22 @@ class ChessMLModel:
 
     def evaluate_position(self, fen: str) -> float:
         """Public evaluation method with caching."""
+        if not TORCH_AVAILABLE or self.model is None:
+            return 0.0
         if fen in self.__dict__.get('_cache', {}):
             self.stats['cache_hits'] += 1
         return self._evaluate_position_impl(fen)
 
     def evaluate_batch(self, fens: List[str]) -> List[float]:
         """Evaluate multiple positions in batch mode."""
-        if self.model is None:
+        if self.model is None or not TORCH_AVAILABLE:
             return [0.0] * len(fens)
         return self.model.evaluate_batch(fens)
 
     def get_stats(self) -> dict:
         """Return evaluation statistics."""
         stats = self.stats.copy()
-        if hasattr(self.evaluate_position, 'cache_info'):
+        if hasattr(self.evaluate_position, 'cache_info') and TORCH_AVAILABLE:
             stats['cache'] = {
                 'hits': self.evaluate_position.cache_info().hits,
                 'misses': self.evaluate_position.cache_info().misses,
@@ -485,22 +518,23 @@ class ChessMLModel:
         return stats
 
     def is_loaded(self) -> bool:
-        return self.model is not None
+        return TORCH_AVAILABLE and self.model is not None
 
     def clear_cache(self):
         """Clear the evaluation cache."""
-        self.evaluate_position.cache_clear()
-        fen_to_tensor_helper.cache_clear()
-        print("🧹 Cache cleared")
+        if TORCH_AVAILABLE:
+            self.evaluate_position.cache_clear()
+            fen_to_tensor_helper.cache_clear()
+            print("🧹 Cache cleared")
 
     def get_info(self) -> dict:
         """Return model information for API."""
         return {
             'loaded': self.is_loaded(),
             'load_time': self.load_time,
-            'device': str(self.device),
+            'device': str(self.device) if self.device else None,
             'half_precision': self.use_half,
-            'model_type': 'Residual CNN (4.9M params)',
-            'training_data': '16.5M positions',
+            'model_type': 'Residual CNN (4.9M params)' if TORCH_AVAILABLE else 'Disabled',
+            'training_data': '16.5M positions' if TORCH_AVAILABLE else 'N/A',
             'stats': self.get_stats()
         }
